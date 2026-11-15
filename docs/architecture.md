@@ -1,0 +1,21 @@
+# Platform architecture
+
+The Student Flutter app is in `users/`; its Dart package name is `vocab_swipe`. The independent Admin Web app is in `admin/admin_panel/`. Shared content models, authentication, local learning and Firebase initialization remain in `users/packages/`. The shared backend and Firebase configuration remain in `users/firebase/` and `users/firebase.json`. Android/Web/Windows Firebase registrations are preserved.
+
+Student reads and local writes use Drift through local_learning. Swipes atomically update progress, queues and an outbox; remote progress upload remains unimplemented. Firestore persistence is disabled so it cannot become a competing operational cache. Admin uses authorized Firestore reads and Functions for privileged mutations. Admin has no Drift dependency. Firebase Admin SDK stays exclusively in `firebase/functions`.
+
+Phase 2 adds shared authentication UI/state, Firebase Google sign-in on supported platforms, email/password authentication, session restoration, profile retry and an authenticated account HTTPS API. Native student builds include Drift downloads/browsing/search/TTS and persistent swipe sessions. Root counter code remains as a regression fixture. Admin only exposes authenticated account/role status; no content or user administration is implemented. Existing StatefulWidget/ChangeNotifier conventions are retained rather than adding routing/state frameworks for a single auth screen.
+
+Android, iOS and Windows are required offline-first release platforms. iOS registration is missing. Native SQLite learning is implemented and tested on the Windows host; full executable, OAuth and installed offline voice acceptance must be verified independently. Student Web remains optional. Admin temporarily reuses the registered Web Firebase app; register a separate Web app before release. No staging/production selection is implemented: the user confirmed ielts-vocubs is development and both sign-in providers are enabled.
+
+Use bounded functions and a single publication revision counter initially. Revisit contention only with measured need. No unnecessary search service, orchestration package, or generated model framework.
+
+## Windows implementation boundary
+
+Use Drift NativeDatabase/SQLite in a per-user application-support directory, with the same migrations, transactions and UID isolation as mobile. Add Windows keyboard/mouse learning controls and offline restart/reconnect acceptance. The current cloud_functions Flutter plugin does not support Windows; bootstrap skips only its unsupported emulator setup on native Windows. No transport or privileged operation is silently substituted. The account HTTPS transport works independently of the Functions plugin, with ID token validation, one refresh retry and server revocation/disabled-user checks. The future progress API must reuse those security boundaries and add idempotency/revisions. Verify desktop Google authentication separately before promising provider support. Windows offline TTS requires an installed compatible English voice and network-disconnected verification.
+
+References: [Drift platforms](https://drift.simonbinder.eu/platforms/), [TTS platforms](https://pub.dev/packages/flutter_tts), [Functions plugin platforms](https://pub.dev/packages/cloud_functions).
+
+The native store uses custom Drift SQL with versioned migration hooks and tested constraints. Nested vocabulary stays lossless in JSON payloads with indexed group columns and local Unicode substring search; senses/example order is preserved. Private rows are scoped by UID. Explicit logout clears private rows with a pending-loss confirmation; public downloaded content remains. SQLite is not encrypted: OS app-data permissions and strict logical UID isolation do not protect against privileged local filesystem access.
+
+Phase 3 adds contentApi and its validation/transaction service under users/firebase/functions/src. The existing download client is unchanged; a live-emulator export is used to verify its manifest/model/Drift contract. Existing deny-direct-write rules enforce the only mutation path. The public feed supports safe noop/upsert/remove records; private spelling reservations and operation ledgers are inaccessible to clients. See publication_api.md.

@@ -1,0 +1,8 @@
+name: shared_models
+publish_to: none
+version: 0.1.0
+environment:
+  sdk: ^3.14.0
+dev_dependencies:
+  test: ^1.26.0
+  lints: ^6.0.0

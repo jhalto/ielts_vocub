@@ -1,0 +1,7 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Media upload is outside Phase 1. No public or owner upload bypass.
+    match /{path=**} { allow read, write: if false; }
+  }
+}

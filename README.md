@@ -1,17 +1,9 @@
-# ielts_vocub
+# VocabSwipe repository
 
-A new Flutter project.
+- `users/`: Student Flutter app (`vocab_swipe`).
+- `admin/admin_panel/`: independent Flutter Web Admin app.
+- `users/packages/`: shared Dart/Flutter packages.
+- `users/firebase/`: shared backend, security rules and tests.
+- `users/firebase.json`: Firebase/Hosting configuration; run Firebase commands from `users/`.
 
-## Getting Started
-
-This project is a starting point for a Flutter application.
-
-A few resources to get you started if this is your first Flutter project:
-
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
-
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+See [setup](docs/setup.md), [architecture](docs/architecture.md), [Phase 2 handoff](docs/phase2_handoff.md) and [Windows offline acceptance](docs/windows_offline_acceptance.md). From each app directory run `flutter pub get`, `flutter analyze`, and `flutter test`. No feature phase is implemented by the folder relocation.

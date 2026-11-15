@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "545371482714",
+    "project_id": "ielts-vocubs",
+    "storage_bucket": "ielts-vocubs.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:545371482714:android:00256cac61214ca30b4663",
+        "android_client_info": {
+          "package_name": "com.example.ielts_vocub"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBaiNDBfZsDYUgzdTXJrQWSBZo3yW5JUmI"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
