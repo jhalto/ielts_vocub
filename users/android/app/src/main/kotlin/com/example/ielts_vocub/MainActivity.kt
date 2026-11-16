@@ -1,4 +1,4 @@
-package com.jhaltoLab.VocubSwipe
+package com.example.ielts_vocub
 
 import io.flutter.embedding.android.FlutterActivity
 

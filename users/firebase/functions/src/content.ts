@@ -4,9 +4,11 @@ import {
   getFirestore,
   FieldValue,
   DocumentData,
+  Transaction,
 } from "firebase-admin/firestore";
 import { onRequest } from "firebase-functions/v2/https";
 import { AccountError, authorizeAdmin } from "./account";
+import { assertManagedAccess } from "./managed_access";
 import {
   Content,
   Mutation,
@@ -85,6 +87,9 @@ function metadata(word?: Word): Record<string, unknown> | null {
 export async function applyContentMutation(
   uid: string,
   input: Mutation,
+  participate?: (
+    tx: Transaction,
+  ) => Promise<(result: Record<string, unknown>) => void>,
 ): Promise<Record<string, unknown>> {
   const db = getFirestore();
   const wordRef = db.doc(`words/${input.wordId}`);
@@ -101,6 +106,9 @@ export async function applyContentMutation(
       manifestRef,
       rateRef,
     );
+    // Trusted services may read their own receipt before writes, then commit it
+    // in this same publication transaction. HTTP clients cannot supply a hook.
+    const complete = participate ? await participate(tx) : undefined;
     const window = Math.floor(Date.now() / 60000);
     const count =
       rate.data()?.window === window ? Number(rate.data()?.count) : 0;
@@ -109,7 +117,9 @@ export async function applyContentMutation(
       if (operation.data()?.fingerprint !== fingerprint)
         return fail("operation-id-reused", 409);
       tx.set(rateRef, { window, count: count + 1 });
-      return { ...operation.data()!.result, replayed: true };
+      const replay = { ...operation.data()!.result, replayed: true };
+      complete?.(replay);
+      return replay;
     }
     let manifest: Manifest;
     if (!manifestSnapshot.exists) {
@@ -265,6 +275,7 @@ export async function applyContentMutation(
       createdAt: FieldValue.serverTimestamp(),
     });
     tx.set(rateRef, { window, count: count + 1 });
+    complete?.(result);
     return result;
   });
 }
@@ -297,6 +308,7 @@ export const contentApi = onRequest(
           401,
         );
       }
+      await assertManagedAccess(token);
       authorizeAdmin(token, await getAuth().getUser(token.uid));
       if (process.env.REQUIRE_CONTENT_APP_CHECK === "true") {
         const attestation = req.header("X-Firebase-AppCheck");

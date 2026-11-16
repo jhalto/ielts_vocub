@@ -10,43 +10,52 @@ import 'package:flutter_tts/flutter_tts.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 
+import 'progress_adapter.dart';
+
 Future<LearningStore>? _store;
-Future<LearningStore> openStore() => _store ??= () async {
-  final directory = await getApplicationSupportDirectory();
-  await directory.create(recursive: true);
-  return LearningStore(
-    NativeDatabase.createInBackground(
-      File('${directory.path}/vocabulary.sqlite'),
-    ),
-  );
-}();
+Future<LearningStore> openStore() => _store ??= _openStore();
+Future<LearningStore> _openStore() async {
+  LearningStore? db;
+  try {
+    final directory = await getApplicationSupportDirectory();
+    await directory.create(recursive: true);
+    db = LearningStore(
+      NativeDatabase.createInBackground(
+        File('${directory.path}/vocabulary.sqlite'),
+      ),
+    );
+    // Force lazy initialization now so the Retry button can open a fresh handle.
+    await db.customSelect('SELECT 1').get();
+    return db;
+  } catch (_) {
+    _store = null;
+    await db?.close();
+    rethrow;
+  }
+}
+
 Widget offlinePanel(String? uid) =>
     OfflinePanel(key: ValueKey(uid ?? 'guest'), uid: uid);
 Future<void> clearOfflinePrivate(String uid) async {
   await (await openStore()).clearPrivate(uid);
 }
 
-class FirestoreContentSource implements PublishedContentSource {
+class FirestoreContentSource implements ContentFeedSource {
   FirestoreContentSource(this.firestore);
   final FirebaseFirestore firestore;
   @override
   Future<ContentSnapshot> manifest() async {
     final snapshot = await firestore
         .doc('contentManifest/current')
-        .get(const GetOptions(source: Source.server));
+        .get(const GetOptions(source: Source.server))
+        .timeout(const Duration(seconds: 30));
     final data = snapshot.data();
-    if (data == null ||
-        data['schemaVersion'] != 1 ||
-        data['currentRevision'] is! int ||
-        data['groupCounts'] is! Map) {
+    if (data == null) {
       throw StateError(
         'Published manifest unavailable. Downloads require the trusted publication backend.',
       );
     }
-    return ContentSnapshot(
-      data['currentRevision'] as int,
-      Map<String, int>.from(data['groupCounts'] as Map),
-    );
+    return ContentSnapshot.fromJson(data);
   }
 
   @override
@@ -62,21 +71,89 @@ class FirestoreContentSource implements PublishedContentSource {
     if (afterId != null) {
       query = query.startAfter([firestore.doc('words/$afterId')]);
     }
-    final page = await query.get(const GetOptions(source: Source.server));
+    final page = await query
+        .get(const GetOptions(source: Source.server))
+        .timeout(const Duration(seconds: 30));
     return page.docs
         .map((doc) => VocabularyWord.fromJson({...doc.data(), 'id': doc.id}))
         .toList();
   }
+
+  @override
+  Future<List<ContentChange>> changes(
+    int afterRevision,
+    int throughRevision,
+  ) async {
+    final query = firestore
+        .collection('contentChanges')
+        .orderBy(FieldPath.documentId)
+        .startAfter([
+          firestore.doc(
+            'contentChanges/${afterRevision.toString().padLeft(16, '0')}',
+          ),
+        ])
+        .endAt([
+          firestore.doc(
+            'contentChanges/${throughRevision.toString().padLeft(16, '0')}',
+          ),
+        ])
+        .limit(100);
+    final result = await query
+        .get(const GetOptions(source: Source.server))
+        .timeout(const Duration(seconds: 30));
+    return result.docs
+        .map((doc) => ContentChange.fromJson(doc.id, doc.data()))
+        .toList();
+  }
+
+  @override
+  Future<List<VocabularyWord>> publishedWords(List<String> ids) async {
+    if (ids.isEmpty) return [];
+    if (ids.length > 30) throw const ContentFailure('content-batch-too-large');
+    try {
+      // Even an editor's authenticated Student session must never download drafts.
+      final result = await firestore
+          .collection('words')
+          .where('isPublished', isEqualTo: true)
+          .where('isRetired', isEqualTo: false)
+          .where(
+            FieldPath.documentId,
+            whereIn: ids.map((id) => firestore.doc('words/$id')).toList(),
+          )
+          .get(const GetOptions(source: Source.server))
+          .timeout(const Duration(seconds: 30));
+      return result.docs
+          .map((doc) => VocabularyWord.fromJson({...doc.data(), 'id': doc.id}))
+          .toList();
+    } on FirebaseException catch (e) {
+      if (e.code == 'permission-denied') {
+        throw const ContentFailure('content-public-query-unavailable');
+      }
+      rethrow;
+    }
+  }
 }
 
 class OfflinePanel extends StatefulWidget {
-  const OfflinePanel({super.key, required this.uid});
+  const OfflinePanel({
+    super.key,
+    required this.uid,
+    this.storeLoader,
+    this.currentUid,
+    this.syncRemoteFactory,
+    this.contentSourceFactory,
+  });
   final String? uid;
+  final Future<LearningStore> Function()? storeLoader;
+  final String? Function()? currentUid;
+  final ProgressRemote Function()? syncRemoteFactory;
+  final ContentFeedSource Function()? contentSourceFactory;
   @override
   State<OfflinePanel> createState() => _OfflinePanelState();
 }
 
-class _OfflinePanelState extends State<OfflinePanel> {
+class _OfflinePanelState extends State<OfflinePanel>
+    with WidgetsBindingObserver {
   LearningStore? store;
   final tts = FlutterTts();
   final search = TextEditingController();
@@ -92,27 +169,60 @@ class _OfflinePanelState extends State<OfflinePanel> {
   Map<String, dynamic>? session;
   String? error;
   String? info;
+  bool localReadFailed = false;
+  ProgressSynchronizer? synchronizer;
+  StreamSubscription<void>? syncSubscription;
+  Timer? syncTimer;
+  SyncView? syncView;
+  List<Map<String, dynamic>> syncIssues = [];
+  int storeEpoch = 0;
   int pending = 0, offset = 0, _request = 0, _downloadGeneration = 0;
   bool busy = false, downloading = false, speaking = false, _disposed = false;
   bool get authorized =>
-      widget.uid == null ||
-      FirebaseAuth.instance.currentUser?.uid == widget.uid;
+      (widget.uid == null ||
+          store == null ||
+          store!.privateEpoch(widget.uid!) == storeEpoch) &&
+      (widget.uid == null ||
+          (widget.currentUid == null
+                  ? FirebaseAuth.instance.currentUser?.uid
+                  : widget.currentUid!()) ==
+              widget.uid);
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     unawaited(_initialize());
   }
 
   Future<void> _initialize() async {
     try {
-      store = await openStore();
+      store = await (widget.storeLoader ?? openStore)();
+      if (!mounted) return;
+      if (widget.uid != null) {
+        storeEpoch = store!.privateEpoch(widget.uid!);
+        synchronizer ??= ProgressSynchronizer(
+          store: store!,
+          uid: widget.uid!,
+          remote: (widget.syncRemoteFactory ?? createProgressRemote)(),
+          stillAuthorized: () => mounted && authorized,
+          reconcileContent: _reconcileContent,
+        );
+        syncSubscription ??= synchronizer!.changes.listen(
+          (_) => unawaited(_refresh()),
+        );
+        syncTimer ??= Timer.periodic(
+          const Duration(seconds: 30),
+          (_) => unawaited(_maybeSync()),
+        );
+      }
       await _refresh();
+      unawaited(_maybeSync());
     } catch (_) {
       if (mounted) {
-        setState(
-          () => error =
-              'Local database unavailable. Check disk access and retry.',
-        );
+        setState(() {
+          localReadFailed = true;
+          error = 'Local database unavailable. Check disk access and retry.';
+        });
       }
     }
   }
@@ -123,41 +233,208 @@ class _OfflinePanelState extends State<OfflinePanel> {
     _request++;
     _downloadGeneration++;
     debounce?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
+    syncTimer?.cancel();
+    unawaited(syncSubscription?.cancel());
+    synchronizer?.dispose();
     search.dispose();
     unawaited(tts.stop());
     super.dispose();
   }
 
+  Future<void> _reconcileContent(bool Function() active) async {
+    try {
+      await ContentReconciler(
+        store!,
+        (widget.contentSourceFactory ??
+            () => FirestoreContentSource(FirebaseFirestore.instance))(),
+      ).reconcile(active: active);
+    } on FirebaseException catch (e) {
+      throw ContentFailure(
+        [
+              'unavailable',
+              'deadline-exceeded',
+              'network-request-failed',
+            ].contains(e.code)
+            ? 'offline'
+            : 'content-read-failed',
+        retryable: [
+          'unavailable',
+          'deadline-exceeded',
+          'network-request-failed',
+        ].contains(e.code),
+      );
+    } on TimeoutException {
+      throw const ContentFailure('offline', retryable: true);
+    } on FormatException {
+      throw const ContentFailure('content-manifest-unsupported');
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) unawaited(_maybeSync());
+  }
+
+  Future<void> _maybeSync() async {
+    if (!mounted ||
+        !authorized ||
+        synchronizer == null ||
+        syncView?.automatic != true) {
+      return;
+    }
+    if (syncView?.phase == 'failed' &&
+        ![
+          'service-unavailable',
+          'sync-interrupted',
+          'content-changed',
+          'content-local-changed',
+          'transaction-contention',
+          'progress-snapshot-changed',
+        ].contains(syncView?.error)) {
+      return;
+    }
+    await _syncNow();
+  }
+
+  String _syncMessage(String code) => switch (code) {
+    'content-changed' || 'content-local-changed' => 'Published vocabulary changed during refresh. Existing downloads are preserved; retry sync.',
+    'content-revision-rollback' ||
+    'content-word-rollback' ||
+    'content-manifest-unsupported' => 'Published vocabulary needs operator attention. Existing downloads are preserved.',
+    'offline' => 'Network unavailable. Learning is saved on this device; reconnect and retry.',
+    'email-unverified' =>
+      'Verify your email and refresh your account before syncing.',
+    'unauthenticated' ||
+    'session-revoked' ||
+    'user-disabled' ||
+    'user-token-expired' =>
+      'Your session is unavailable. Review your account before syncing.',
+    'rate-limited' => 'The server asked this device to wait before retrying.',
+    'app-check-required' || 'app-check-invalid' =>
+      'This installation needs app verification setup. Contact the operator.',
+    'local-intent-changed' => 'You saved newer learning. Review the updated local intent before choosing again.',
+    'refresh-published-content-first' =>
+      'Refresh published vocabulary before retrying this saved intent.',
+    'progress-snapshot-changed' =>
+      'Progress changed on another device. Retry to fetch a complete view.',
+    _ => 'Sync could not complete. Your local intent is preserved. Retry or contact the operator.',
+  };
+  Future<void> _syncNow() async {
+    try {
+      await synchronizer?.sync();
+      await _refresh();
+    } catch (_) {
+      if (mounted) {
+        setState(
+          () => error = 'Progress sync could not access local storage. Your learning remains local.',
+        );
+      }
+    }
+  }
+
+  Future<void> _resolveIssue(Map<String, dynamic> issue, bool keepLocal) async {
+    final accepted = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(
+          keepLocal ? 'Keep latest local intent?' : 'Use server progress?',
+        ),
+        content: Text(
+          keepLocal
+              ? 'Save your latest local learning for ${issue['spelling'] ?? 'this word'} using current server progress. Earlier attempts remain in local history.'
+              : 'Replace local learning for ${issue['spelling'] ?? 'this word'} with current server progress. This replaces its pending local changes; attempts remain in local history.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Confirm'),
+          ),
+        ],
+      ),
+    );
+    if (accepted != true || !mounted || !authorized) return;
+    try {
+      await synchronizer!.resolve(
+        issue['word_id'] as String,
+        issue['latest_operation_id'] as String,
+        keepLocal: keepLocal,
+      );
+      await _refresh();
+    } catch (e) {
+      if (mounted) {
+        setState(
+          () => error = e is SyncFailure
+              ? _syncMessage(e.code)
+              : 'Resolution failed. Local intent is preserved.',
+        );
+      }
+    }
+  }
+
   Future<void> _refresh() async {
     final db = store;
-    if (db == null) return;
+    if (db == null || !mounted || !authorized) return;
     final request = ++_request;
-    final next = await db.browse(
-      category: category,
-      difficulty: difficulty,
-      search: search.text,
-      uid: widget.uid,
-      status: unmarkedOnly ? null : status,
-      partOfSpeech: partOfSpeech,
-      unmarkedOnly: unmarkedOnly,
-      offset: offset,
-    );
-    final counts = await db.statistics(widget.uid, category, difficulty);
-    final manifests = await db.downloads();
-    final restored = widget.uid == null ? null : await db.session(widget.uid!);
-    final queued = widget.uid == null ? 0 : await db.pendingCount(widget.uid!);
-    if (!mounted || request != _request || !authorized) return;
-    setState(() {
-      words = next;
-      stats = counts;
-      downloads = manifests;
-      session = restored;
-      pending = queued;
-    });
+    try {
+      if (widget.uid != null) {
+        await db.materializeProgress(
+          widget.uid!,
+          active: () => mounted && authorized,
+        );
+      }
+      final next = await db.browse(
+        category: category,
+        difficulty: difficulty,
+        search: search.text,
+        uid: widget.uid,
+        status: unmarkedOnly ? null : status,
+        partOfSpeech: partOfSpeech,
+        unmarkedOnly: unmarkedOnly,
+        offset: offset,
+      );
+      final counts = await db.statistics(widget.uid, category, difficulty);
+      final manifests = await db.downloads();
+      final restored = widget.uid == null
+          ? null
+          : await db.session(widget.uid!);
+      final queued = widget.uid == null
+          ? 0
+          : await db.pendingCount(widget.uid!);
+      final nextSync = widget.uid == null
+          ? null
+          : await db.syncView(widget.uid!);
+      final nextIssues = widget.uid == null
+          ? <Map<String, dynamic>>[]
+          : await db.syncIssues(widget.uid!);
+      if (!mounted || request != _request || !authorized) return;
+      setState(() {
+        if (localReadFailed) error = null;
+        localReadFailed = false;
+        words = next;
+        stats = counts;
+        downloads = manifests;
+        session = restored;
+        pending = queued;
+        syncView = nextSync;
+        syncIssues = nextIssues;
+      });
+    } catch (_) {
+      if (mounted && request == _request && authorized) {
+        setState(() {
+          localReadFailed = true;
+          error = 'Local data could not be read. Check disk access and retry.';
+        });
+      }
+    }
   }
 
   Future<void> _run(Future<void> Function() action) async {
-    if (busy) return;
+    if (!mounted || busy || !authorized) return;
     setState(() {
       busy = true;
       error = null;
@@ -165,6 +442,7 @@ class _OfflinePanelState extends State<OfflinePanel> {
     try {
       await action();
       await _refresh();
+      unawaited(_maybeSync());
     } catch (e) {
       if (mounted) {
         setState(
@@ -209,7 +487,11 @@ class _OfflinePanelState extends State<OfflinePanel> {
     } catch (e) {
       if (mounted) {
         setState(
-          () => error = e is StateError ? e.message.toString() : 'Download failed. Check internet and retry; existing offline content is preserved.',
+          () => error = e is StateError
+              ? e.message.toString()
+              : e is FormatException
+              ? 'Unsupported or invalid published content. Update the app or contact the operator; existing offline content is preserved.'
+              : 'Download failed. Check internet and retry; existing offline content is preserved.',
         );
       }
     } finally {
@@ -329,6 +611,7 @@ class _OfflinePanelState extends State<OfflinePanel> {
         category,
         difficulty,
         review: review,
+        stillAuthorized: () => !_disposed && authorized,
       ),
     );
   }
@@ -364,12 +647,25 @@ class _OfflinePanelState extends State<OfflinePanel> {
             child: const Text('Open local database'),
           ),
         if (error != null)
-          Semantics(
-            liveRegion: true,
-            child: Text(
-              error!,
-              style: TextStyle(color: Theme.of(context).colorScheme.error),
-            ),
+          Column(
+            children: [
+              Semantics(
+                liveRegion: true,
+                child: Text(
+                  error!,
+                  style: TextStyle(color: Theme.of(context).colorScheme.error),
+                ),
+              ),
+              if (localReadFailed)
+                TextButton(
+                  onPressed: busy
+                      ? null
+                      : () => unawaited(
+                          store == null ? _initialize() : _refresh(),
+                        ),
+                  child: const Text('Retry local read'),
+                ),
+            ],
           ),
         if (info != null) Semantics(liveRegion: true, child: Text(info!)),
         const Text(
@@ -407,6 +703,7 @@ class _OfflinePanelState extends State<OfflinePanel> {
           ],
         ),
         DropdownButtonFormField<Category>(
+          isExpanded: true,
           initialValue: category,
           decoration: const InputDecoration(labelText: 'Category'),
           items: Category.values
@@ -423,6 +720,7 @@ class _OfflinePanelState extends State<OfflinePanel> {
                 },
         ),
         DropdownButtonFormField<Difficulty>(
+          isExpanded: true,
           initialValue: difficulty,
           decoration: const InputDecoration(labelText: 'Difficulty'),
           items: Difficulty.values
@@ -456,8 +754,94 @@ class _OfflinePanelState extends State<OfflinePanel> {
         ),
         if (widget.uid != null)
           Text(
-            'Completion: ${total == 0 ? 0 : (known / total * 100).round()}% of local group. $pending changes pending cloud sync (not yet implemented).',
+            'Completion: ${total == 0 ? 0 : (known / total * 100).round()}% of local group. $pending changes not yet backed up.',
           ),
+        if (widget.uid != null && synchronizer != null) ...[
+          const Divider(),
+          Semantics(
+            liveRegion: true,
+            child: Text(syncView?.label ?? 'Changes pending'),
+          ),
+          Text(
+            syncView?.lastSuccess == null
+                ? 'No successful cloud sync yet.'
+                : 'Last successful sync: ${syncView!.lastSuccess!.toLocal()}',
+          ),
+          if (syncView?.error != null) Text(_syncMessage(syncView!.error!)),
+          if (syncView?.nextRetry != null)
+            Text('Retry available after ${syncView!.nextRetry!.toLocal()}'),
+          FilledButton.tonal(
+            onPressed: syncView?.phase == 'syncing' || !authorized
+                ? null
+                : _syncNow,
+            child: const Text('Sync Now'),
+          ),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Automatic progress sync'),
+            subtitle: const Text(
+              'Uploads saved learning for this account. Off until you enable it on this device.',
+            ),
+            value: syncView?.automatic ?? false,
+            onChanged: syncView?.phase == 'syncing'
+                ? null
+                : (enabled) async {
+                    try {
+                      await store!.setAutomaticSync(
+                        widget.uid!,
+                        enabled,
+                        active: () => mounted && authorized,
+                      );
+                      await _refresh();
+                      if (enabled) unawaited(_maybeSync());
+                    } catch (_) {
+                      if (mounted) {
+                        setState(
+                          () => error = 'Could not save your sync preference.',
+                        );
+                      }
+                    }
+                  },
+          ),
+          for (final issue in syncIssues)
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Text(
+                      'Saved learning needs attention: ${issue['spelling'] ?? 'Downloaded word'}',
+                    ),
+                    Text(
+                      'Local: ${issue['local_status'] ?? 'unmarked'}; server: ${issue['remote_status'] ?? 'unmarked'}.',
+                    ),
+                    if (issue['last_error'] == 'word-unavailable')
+                      const Text(
+                        'This word is no longer available. Refresh published vocabulary before retrying your saved intent.',
+                      ),
+                    Wrap(
+                      spacing: 8,
+                      children: [
+                        TextButton(
+                          onPressed: syncView?.phase == 'syncing'
+                              ? null
+                              : () => _resolveIssue(issue, true),
+                          child: const Text('Keep latest local intent'),
+                        ),
+                        TextButton(
+                          onPressed: syncView?.phase == 'syncing'
+                              ? null
+                              : () => _resolveIssue(issue, false),
+                          child: const Text('Use server progress'),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+        ],
         TextField(
           controller: search,
           decoration: const InputDecoration(
@@ -473,6 +857,7 @@ class _OfflinePanelState extends State<OfflinePanel> {
         ),
         if (widget.uid != null)
           DropdownButtonFormField<ProgressStatus?>(
+            isExpanded: true,
             initialValue: status,
             decoration: const InputDecoration(labelText: 'Progress filter'),
             items: [
@@ -497,6 +882,7 @@ class _OfflinePanelState extends State<OfflinePanel> {
             },
           ),
         DropdownButtonFormField<PartOfSpeech?>(
+          isExpanded: true,
           initialValue: partOfSpeech,
           decoration: const InputDecoration(labelText: 'Part of speech'),
           items: [
@@ -587,7 +973,7 @@ class _OfflinePanelState extends State<OfflinePanel> {
               'Session: ${session!['category']} / ${session!['difficulty']} - ${queue.length} remaining',
             ),
             Text(
-              'Committed outcomes: ${(jsonDecode(session!["outcomes"] as String) as Map).length} words; pending cloud sync.',
+              'Committed outcomes: ${(jsonDecode(session!["outcomes"] as String) as Map).length} words. Cloud status is shown above.',
             ),
             if (queue.isEmpty)
               Text(
@@ -597,7 +983,12 @@ class _OfflinePanelState extends State<OfflinePanel> {
               FilledButton(
                 onPressed: busy
                     ? null
-                    : () => _run(() => store!.tryAgain(widget.uid!)),
+                    : () => _run(
+                        () => store!.tryAgain(
+                          widget.uid!,
+                          stillAuthorized: () => !_disposed && authorized,
+                        ),
+                      ),
                 child: const Text('Try Again'),
               ),
             if (queue.isNotEmpty && session!['waiting'] != 1) ...[

@@ -1,4 +1,32 @@
-# Planned synchronization contract ? not implemented in Phase 1
+# Synchronization contract
+
+## Phase 8 implemented content reconciliation
+
+Native Student sync runs progress upload, complete remote progress retrieval, then content reconciliation. Drift remains the operational source of truth. Sync Now uses this sequence; the existing per-account/device automatic opt-in uses it on resume and its foreground timer. An incomplete content refresh leaves the overall run failed/offline and does not advance the last-success time, even when progress was already acknowledged. Acknowledged operations are not re-uploaded as new operations. Offline learning continues during network reads.
+
+Only previously downloaded categories are refreshed. Each category covers all three difficulties and has a trusted content_checkpoints revision. A new/legacy installation with no trusted cursor first refreshes its existing downloaded scopes through the full downloader. No downloaded categories means no implicit content download. Cursors belong to the shared public cache, not to private user progress; logout retains public content/checkpoints and clears private data under the existing policy.
+
+Require manifest schemaVersion=1/publisherVersion=1, nine exact nonnegative group counts, valid monotonic currentRevision and retention watermark. Read contentChanges by canonical 16-digit document ID, strictly after the lowest selected-category checkpoint through the opening revision, at most 100 records/page and 10,000 revisions/run. Require every intervening revision, including noops. Noop has no word ID or payload. Collapse each word's public events to its final upsert/remove; fetch upserts in batches of at most 30 using published/non-retired queries. Validate word IDs, schema, publication state and exact upsert revision. Missing or denied public ID lookups are unsafe, never implicit tombstones.
+
+Stage separately, then require a closing manifest with identical revision, publisher version, counts and retention watermark. A SQLite transaction checks the captured public-cache generation, applies upserts/removals, validates each selected group's exact count, prunes removed/moved queue entries and advances completeness/checkpoints together. Manual downloads and progress rejection of unavailable words bump that generation, preventing an older in-flight refresh from overwriting their result. New swipes may continue and remain intact: content reconciliation never rewrites progress, sequences, outcomes or outbox payloads. Tombstoned words retain stable IDs and historical payload rows with published=0; republishing restores visibility under the same ID.
+
+Missing/expired checkpoints, a gap/invalid feed, missing payload, count mismatch, denied bounded public lookup or a feed window over 10,000 revisions triggers the existing verified full-snapshot downloader for all selected categories together. Stage every category before committing any; verify the opening/closing manifest and counts and require a trusted publisher. Snapshot recovery remains bounded to 10,000 words. Failed or interrupted recovery preserves the prior live cache/cursors. Retry explicitly, or through the existing opt-in scheduler when its error policy permits. Concurrent manifest/local-generation changes retry incrementally up to three attempts; continuous contention or a changing fallback snapshot surfaces failure for a later run. Global/per-word revision rollback fails closed rather than downgrading the cache. No cursor advances on failed validation or commit.
+
+Schema 3 adds public category checkpoints, a cache-generation row and transient delta staging. Version 1 upgrades through the existing progress migration; version 2 adds only the new tables. No old cursor is fabricated. Restart discards incomplete staging. Account epochs/cancellation are checked before network phases and inside the final transaction; a late reply cannot commit after logout/account replacement. Single-flight content work shares the local store; cross-process/background synchronization is not implemented.
+
+The earlier phase sections below are historical. Phase 7 implemented Windows authenticated progress HTTPS transport; Phase 8 uses the existing native Firestore published-content adapter for Android, iOS and Windows. iOS registration/build/device acceptance remains outstanding on this Windows host. See phase8_handoff.md for actual evidence and limits.
+
+## Phase 7 implemented client boundary
+
+The native Student client now implements progress upload/reconciliation through progressApi. See phase7_handoff.md for schema version 2, exact retry/acknowledgement guards, staging, conflict choices and actual tests. Automatic progress sync is opt-in per UID/device; Sync Now is explicit. Frozen outbox requests survive restart, older acknowledgements cannot replace newer intent, and explicit rebases create new linked IDs. Local learning never waits on Firebase.
+
+The client sends at most 100 operations/run, uses three bounded request attempts, persists rate backoff, and stages at most 200 ID-ordered progress pages. Snapshot changes restart from page one up to three attempts. No content delta reader, global account deletion, silent receipt pruning or OS background job is implemented. Earlier Phase 2/3/6 descriptions below are historical boundaries, superseded for progress-client delivery by this section. The remaining future protocol still applies to content changes and release operations.
+
+## Phase 6 current boundary
+
+The trusted progress HTTPS backend is now implemented; see progress_api.md and phase6_handoff.md. Uploads use immutable operation IDs, revision preconditions, atomic UID-scoped receipts/progress/counter writes and explicit conflicts. Snapshot pagination detects concurrent changes and requires a restart. Sequence/device metadata is not a trusted ordering clock, preserving compatibility with logout sequence resets. Receipts remain unpruned with documented storage/retention limits. Existing direct client progress writes remain denied.
+
+The protocol below describes the eventual client. No uploader, acknowledgement, remote merge, UI sync state or content delta consumer is connected in Phase 6. Durable Student outbox rows remain local pending intent. The next approved client task must preserve newer local edits and UID boundaries, map existing outbox fields to progress_api.md and implement bounded deliberate rebase/snapshot restart behavior.
 
 Drift is the student operational source of truth. A swipe commits progress, persisted queue/session changes and UID-owned outbox record atomically. A single-flight synchronizer uploads only the authenticated UID, then reconciles paginated remote progress, then content changes.
 

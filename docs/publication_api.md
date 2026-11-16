@@ -1,5 +1,21 @@
 # Trusted vocabulary publication API (Phase 3)
 
+## Phase 11 managed authorization
+
+Enrolled accounts also require a non-pending/enabled server membership with matching role/adminRevision and fresh auth_time. account-change-pending/session-stale return 401; an older session's refresh may be insufficient after revocation, requiring a new sign-in after the management result's timestamp. Vocabulary mutation bodies/receipts remain unchanged. Updated rules gate privileged reads too. Missing membership preserves legacy behavior; see user_admin_api.md for adoption/rollout/trust boundaries. Nothing was deployed.
+
+## Phase 9 trusted import integration
+
+importApi (documented in import_api.md) reuses validateMutation/validateContent/requirePublishable and applyContentMutation. A trusted server-only transaction participant reads frozen job/item preconditions before writes and atomically commits the item receipt/counters/import audit with the existing publication transaction. The contentApi HTTP body, response, authorization, limits and direct-write denial remain unchanged; clients cannot supply this participant. Import create always produces a draft/noop. Import update preserves publication state and requires the existing reviewed=true/completeness checks for a published word. Publication revisions/counts/feed and stable IDs/progress remain authoritative. No deployment is included.
+
+## Phase 8 Student consumer
+
+The native Student client now consumes this existing publication contract after progress synchronization. Earlier statements below about the unchanged full downloader describe Phase 3's delivery boundary. See sync_protocol.md and phase8_handoff.md for the current per-downloaded-category checkpoints, bounded feed reads, atomic Drift commit and verified snapshot recovery. No backend API, security-rule or registration change is introduced by Phase 8.
+
+Read contentChanges in canonical document-ID order, strictly after the saved revision and through the opening manifest revision. Every revision must appear, including payload-free noops. Upserts reference the current published/non-retired word payload; removals hide cached words and prune queues while retaining history. A changed closing manifest invalidates staged work. Published-ID lookups always include isPublished=true/isRetired=false, including in an editor-authenticated Student session. A missing payload or permission-denied ID lookup triggers the verified public full-query fallback rather than exposing drafts or inferring a tombstone. The emulator probe verifies unpublished/restored drafts remain unreadable under public credentials.
+
+The existing published-word indexes cover these queries; contentChanges uses its document-ID index. No new index is added. Emulator success does not verify index deployment in a live Firebase project. Retention remains unpruned in production code; tests alter only demo emulator records to exercise expired cursors and gaps. Revisions must never be reset. Clients reject server rollback without downgrading their cache.
+
 Implementation: `users/firebase/functions/src/content.ts` and `content_validation.ts`. HTTPS endpoint: `POST https://us-central1-PROJECT_ID.cloudfunctions.net/contentApi`; local isolated emulator: `http://localhost:15001/demo-vocabulary/us-central1/contentApi`. Nothing has been deployed.
 
 ## Authorization and request envelope

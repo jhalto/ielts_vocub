@@ -2,9 +2,21 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
     function signedIn() { return request.auth != null; }
-    function owner(uid) { return signedIn() && request.auth.uid == uid; }
-    function editor() { return signedIn() && request.auth.token.role in ['super_admin', 'content_manager']; }
-    function superAdmin() { return signedIn() && request.auth.token.role == 'super_admin'; }
+    function managedAccess() {
+      let path = /databases/$(database)/documents/managedAccounts/$(request.auth.uid);
+      return !exists(path) || (
+        get(path).data.schemaVersion == 1 &&
+        get(path).data.pendingOperation == null &&
+        get(path).data.disabled == false &&
+        (!('minAuthTime' in get(path).data) || get(path).data.minAuthTime == 0 ||
+          ('auth_time' in request.auth.token && request.auth.token.auth_time >= get(path).data.minAuthTime)) &&
+        (('role' in request.auth.token ? request.auth.token.role : 'student') == get(path).data.role) &&
+        (('adminRevision' in request.auth.token ? request.auth.token.adminRevision : 0) == get(path).data.revision)
+      );
+    }
+    function owner(uid) { return signedIn() && request.auth.uid == uid && managedAccess(); }
+    function editor() { return signedIn() && request.auth.token.role in ['super_admin', 'content_manager'] && managedAccess(); }
+    function superAdmin() { return signedIn() && request.auth.token.role == 'super_admin' && managedAccess(); }
     match /words/{id} {
       allow read: if editor() || (resource.data.isPublished == true && resource.data.isRetired == false);
       allow write: if false;

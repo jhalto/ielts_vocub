@@ -12,8 +12,12 @@ class AuthShell extends StatefulWidget {
     this.adminOnly = false,
     this.offlineBuilder,
     this.clearPrivate,
+    this.controller,
   });
   final AuthRepository repository;
+
+  /// Allows a host app to reuse the same authorization gate without duplicate checks.
+  final AuthController? controller;
   final bool adminOnly;
   final Widget Function(String? uid)? offlineBuilder;
   final Future<void> Function(String uid)? clearPrivate;
@@ -27,11 +31,13 @@ class _AuthShellState extends State<AuthShell> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
-    controller = AuthController(
-      widget.repository,
-      adminOnly: widget.adminOnly,
-      clearPrivate: widget.clearPrivate,
-    );
+    controller =
+        widget.controller ??
+        AuthController(
+          widget.repository,
+          adminOnly: widget.adminOnly,
+          clearPrivate: widget.clearPrivate,
+        );
     WidgetsBinding.instance.addObserver(this);
     _timer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (mounted) setState(() {});
@@ -49,7 +55,7 @@ class _AuthShellState extends State<AuthShell> with WidgetsBindingObserver {
   void dispose() {
     _timer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
-    controller.dispose();
+    if (widget.controller == null) controller.dispose();
     super.dispose();
   }
 

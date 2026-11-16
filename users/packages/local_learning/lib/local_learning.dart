@@ -1,9 +1,20 @@
 import 'dart:convert';
 import 'dart:math';
+import 'dart:async';
 
 import 'package:drift/drift.dart';
 import 'package:shared_models/shared_models.dart';
+
+import 'src/progress_sync.dart';
+import 'src/content_sync.dart';
+
 export 'package:shared_models/shared_models.dart';
+
+export 'src/progress_sync.dart';
+export 'src/content_sync.dart';
+
+part 'src/progress_store.dart';
+part 'src/content_store.dart';
 
 String newId() => List.generate(
   16,
@@ -21,8 +32,12 @@ ProgressStatus swipeStatus(ProgressStatus? current, bool right) => !right
 /// representation; indexed group/search columns avoid Firestore reads offline.
 class LearningStore extends GeneratedDatabase {
   LearningStore(super.executor);
+  final Map<String, int> _privateEpochs = {};
+  final Map<String, Future<void>> _syncFlights = {};
+  Future<void>? _contentFlight;
+  int privateEpoch(String uid) => _privateEpochs[uid] ?? 0;
   @override
-  int get schemaVersion => 1;
+  int get schemaVersion => 3;
   @override
   Iterable<TableInfo<Table, Object?>> get allTables => const [];
   @override
@@ -31,19 +46,32 @@ class LearningStore extends GeneratedDatabase {
       for (final sql in schema) {
         await customStatement(sql);
       }
+      await _createSyncSchema();
+      await _createContentSchema();
       await customStatement('INSERT INTO local_metadata VALUES(?,?)', [
         'device_id',
         newId(),
       ]);
     },
     onUpgrade: (_, from, to) async {
-      throw StateError('Unsupported migration $from -> $to');
+      if ((from != 1 && from != 2) || to != 3) {
+        throw StateError('Unsupported migration $from -> $to');
+      }
+      await transaction(() async {
+        if (from == 1) await _createSyncSchema();
+        await _createContentSchema();
+      });
     },
     beforeOpen: (_) async {
       await customStatement('PRAGMA foreign_keys = ON');
       await customStatement('PRAGMA secure_delete = ON');
       // Cancelled/crashed snapshots restart; staged rows never become published.
       await customStatement('DELETE FROM download_staging');
+      await customStatement('DELETE FROM progress_staging');
+      await customStatement('DELETE FROM content_delta_staging');
+      await customStatement(
+        "UPDATE sync_status SET phase='failed',last_error='sync-interrupted' WHERE phase='syncing'",
+      );
     },
   );
   static const schema = [
@@ -83,6 +111,8 @@ class LearningStore extends GeneratedDatabase {
   Future<void> stage(String downloadId, List<VocabularyWord> words) =>
       transaction(() async {
         for (final word in words) {
+          // Constructors also serve tests/editors; validate the persisted wire payload.
+          VocabularyWord.fromJson(word.toJson());
           if (!word.isPublished || word.isRetired) {
             throw const FormatException('Only published words may be cached');
           }
@@ -101,8 +131,24 @@ class LearningStore extends GeneratedDatabase {
     String downloadId,
     Category? category,
     int revision,
-    Map<String, int> expectedCounts,
-  ) => transaction(() async {
+    Map<String, int> expectedCounts, {
+    bool Function()? stillWanted,
+    Set<Category>? scopes,
+    bool trustedManifest = false,
+    int? expectedGeneration,
+  }) => transaction(() async {
+    void checkWanted() {
+      if (stillWanted != null && !stillWanted()) {
+        throw StateError('Download cancelled. Existing content is preserved.');
+      }
+    }
+
+    checkWanted();
+    if (expectedGeneration != null &&
+        await contentGeneration() != expectedGeneration) {
+      throw const ContentFailure('content-local-changed', retryable: true);
+    }
+    ContentSnapshot(revision, expectedCounts).validate(category);
     final versions = await rows(
       'SELECT MAX(revision) AS version FROM downloaded_groups',
     );
@@ -120,7 +166,14 @@ class LearningStore extends GeneratedDatabase {
           ),
         )
         .toList();
-    final categories = category == null ? Category.values : [category];
+    if (words.any(
+      (w) => !w.isPublished || w.isRetired || w.revision > revision,
+    )) {
+      throw StateError('Invalid staged publication');
+    }
+    final categories =
+        scopes?.toList() ?? (category == null ? Category.values : [category]);
+    if (categories.isEmpty) throw StateError('No download scope');
     for (final cat in categories) {
       for (final difficulty in Difficulty.values) {
         final key = '${cat.name}/${difficulty.name}';
@@ -132,7 +185,7 @@ class LearningStore extends GeneratedDatabase {
         }
       }
     }
-    if (words.any((w) => category != null && w.category != category)) {
+    if (words.any((w) => !categories.contains(w.category))) {
       throw StateError('Wrong download category');
     }
     // New snapshots invalidate previous-version completeness until redownloaded.
@@ -140,35 +193,12 @@ class LearningStore extends GeneratedDatabase {
       'UPDATE downloaded_groups SET complete=0 WHERE revision<>?',
       [revision],
     );
-    if (category == null) {
-      await customStatement('UPDATE words SET published=0');
-    } else {
-      await customStatement('UPDATE words SET published=0 WHERE category=?', [
-        category.name,
-      ]);
-    }
+    await customStatement(
+      'UPDATE words SET published=0 WHERE category IN (${List.filled(categories.length, '?').join(',')})',
+      categories.map((c) => c.name).toList(),
+    );
     for (final word in words) {
-      final search = [
-        word.spelling,
-        for (final s in word.senses) ...[
-          s.englishMeaning,
-          s.bengaliMeaning,
-          for (final e in s.examples) ...[e.english, e.bengali],
-        ],
-      ].join(' ').toLowerCase();
-      await customStatement(
-        'INSERT INTO words VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET category=excluded.category,difficulty=excluded.difficulty,ordering=excluded.ordering,revision=excluded.revision,published=excluded.published,payload=excluded.payload,searchable=excluded.searchable',
-        [
-          word.id,
-          word.category.name,
-          word.difficulty.name,
-          word.ordering,
-          word.revision,
-          1,
-          jsonEncode(word.toJson()),
-          search,
-        ],
-      );
+      await _putContentWord(word);
     }
     for (final cat in categories) {
       for (final d in Difficulty.values) {
@@ -184,6 +214,20 @@ class LearningStore extends GeneratedDatabase {
         );
       }
     }
+    for (final cat in categories) {
+      if (trustedManifest) {
+        await customStatement(
+          'INSERT INTO content_checkpoints VALUES(?,?) ON CONFLICT(category) DO UPDATE SET revision=excluded.revision',
+          [cat.name, revision],
+        );
+      } else {
+        await customStatement(
+          'DELETE FROM content_checkpoints WHERE category=?',
+          [cat.name],
+        );
+      }
+    }
+    await _bumpContentGeneration();
     await discard(downloadId);
     // Retired/moved words no longer belong in active queues. History remains.
     await customStatement(
@@ -192,6 +236,9 @@ class LearningStore extends GeneratedDatabase {
     await customStatement(
       'UPDATE learning_sessions SET waiting=0 WHERE NOT EXISTS(SELECT 1 FROM learning_queue_items q WHERE q.session_id=learning_sessions.id)',
     );
+    // Cancellation/account changes while SQLite was awaiting a write roll back
+    // words, completeness, queue pruning and staging removal together.
+    checkWanted();
   });
   Future<List<VocabularyWord>> browse({
     required Category category,
@@ -243,27 +290,38 @@ class LearningStore extends GeneratedDatabase {
       rows('SELECT * FROM downloaded_groups ORDER BY category,difficulty');
   Future<int> pendingCount(String uid) async =>
       (await rows(
-            'SELECT COUNT(*) AS count FROM pending_sync_operations WHERE uid=?',
+            "SELECT COUNT(*) AS count FROM pending_sync_operations WHERE uid=? AND state IN ('pending','inflight','conflict','rejected')",
             [uid],
           )).single['count']
           as int;
-  Future<void> clearPrivate(String uid) => transaction(() async {
-    for (final table in [
-      'learning_sessions',
-      'pending_sync_operations',
-      'user_progress',
-      'local_sequences',
-    ]) {
-      await customStatement('DELETE FROM $table WHERE uid=?', [uid]);
-    }
-  });
+  Future<void> clearPrivate(String uid) {
+    _privateEpochs[uid] = privateEpoch(uid) + 1;
+    return transaction(() async {
+      for (final table in [
+        'learning_sessions',
+        'pending_sync_operations',
+        'user_progress',
+        'local_sequences',
+        'remote_progress',
+        'progress_staging',
+        'sync_status',
+      ]) {
+        await customStatement('DELETE FROM $table WHERE uid=?', [uid]);
+      }
+    });
+  }
+
   Future<void> startSession(
     String uid,
     Category category,
     Difficulty difficulty, {
     ProgressStatus? review,
+    bool Function()? stillAuthorized,
   }) => transaction(() async {
     if (uid.trim().isEmpty) throw StateError('Sign in before saving progress');
+    if (stillAuthorized != null && !stillAuthorized()) {
+      throw StateError('Account changed');
+    }
     final result = await rows(
       "SELECT w.id FROM words w LEFT JOIN user_progress p ON p.word_id=w.id AND p.uid=? WHERE w.published=1 AND w.category=? AND w.difficulty=? AND ((? IS NULL AND (p.status IS NULL OR p.status='didnt_know')) OR p.status=?) ORDER BY w.ordering,w.id",
       [
@@ -287,6 +345,9 @@ class LearningStore extends GeneratedDatabase {
         i,
       ]);
     }
+    if (stillAuthorized != null && !stillAuthorized()) {
+      throw StateError('Account changed');
+    }
   });
   Future<Map<String, dynamic>?> session(String uid) async {
     final sessions = await rows('SELECT * FROM learning_sessions WHERE uid=?', [
@@ -308,10 +369,19 @@ class LearningStore extends GeneratedDatabase {
     return result;
   }
 
-  Future<void> tryAgain(String uid) => customStatement(
-    'UPDATE learning_sessions SET waiting=0 WHERE uid=?',
-    [uid],
-  );
+  Future<void> tryAgain(String uid, {bool Function()? stillAuthorized}) =>
+      transaction(() async {
+        if (stillAuthorized != null && !stillAuthorized()) {
+          throw StateError('Account changed');
+        }
+        await customStatement(
+          'UPDATE learning_sessions SET waiting=0 WHERE uid=?',
+          [uid],
+        );
+        if (stillAuthorized != null && !stillAuthorized()) {
+          throw StateError('Account changed');
+        }
+      });
   Future<void> swipe(
     String uid,
     String expectedWordId,
@@ -396,9 +466,78 @@ class LearningStore extends GeneratedDatabase {
 }
 
 class ContentSnapshot {
-  const ContentSnapshot(this.revision, this.groupCounts);
+  ContentSnapshot(
+    this.revision,
+    Map<String, int> groupCounts, {
+    this.publisherVersion,
+    this.oldestRetainedRevision = 0,
+  }) : groupCounts = Map.unmodifiable(groupCounts);
   final int revision;
   final Map<String, int> groupCounts;
+  final int? publisherVersion;
+  final int oldestRetainedRevision;
+  bool sameVersion(ContentSnapshot other) =>
+      revision == other.revision &&
+      publisherVersion == other.publisherVersion &&
+      oldestRetainedRevision == other.oldestRetainedRevision &&
+      groupCounts.length == other.groupCounts.length &&
+      groupCounts.entries.every((e) => other.groupCounts[e.key] == e.value);
+
+  factory ContentSnapshot.fromJson(Map<String, dynamic> json) {
+    final counts = json['groupCounts'];
+    if (json['schemaVersion'] != 1 ||
+        json['currentRevision'] is! int ||
+        counts is! Map ||
+        (json.containsKey('oldestRetainedRevision') &&
+            json['oldestRetainedRevision'] is! int) ||
+        (json.containsKey('publisherVersion') &&
+            (json['publisherVersion'] is! int ||
+                json['publisherVersion'] != 1))) {
+      throw const FormatException('Unsupported publication manifest');
+    }
+    final keys = {
+      for (final c in Category.values)
+        for (final d in Difficulty.values) '${c.name}/${d.name}',
+    };
+    if (counts.length != keys.length ||
+        counts.keys.any((key) => !keys.contains(key)) ||
+        counts.values.any((value) => value is! int || value < 0)) {
+      throw const FormatException('Invalid publication group counts');
+    }
+    final snapshot = ContentSnapshot(
+      json['currentRevision'] as int,
+      Map<String, int>.from(counts),
+      publisherVersion: json['publisherVersion'] as int?,
+      oldestRetainedRevision: json.containsKey('oldestRetainedRevision')
+          ? json['oldestRetainedRevision'] as int
+          : 0,
+    );
+    snapshot.validate(null);
+    if (json.containsKey('totalPublished') &&
+        (json['totalPublished'] is! int ||
+            json['totalPublished'] !=
+                snapshot.groupCounts.values.fold<int>(0, (a, b) => a + b))) {
+      throw const FormatException('Publication total does not match groups');
+    }
+    return snapshot;
+  }
+
+  void validate(Category? category) {
+    if (revision < 0 ||
+        revision >= 9007199254740991 ||
+        oldestRetainedRevision < 0 ||
+        oldestRetainedRevision > revision) {
+      throw const FormatException('Invalid publication revision');
+    }
+    for (final c in category == null ? Category.values : [category]) {
+      for (final d in Difficulty.values) {
+        final count = groupCounts['${c.name}/${d.name}'];
+        if (count == null || count < 0) {
+          throw const FormatException('Missing or invalid publication group');
+        }
+      }
+    }
+  }
 }
 
 abstract interface class PublishedContentSource {
@@ -414,40 +553,61 @@ class ContentDownloader {
     Category? category, {
     required bool Function() cancelled,
     void Function(int)? onProgress,
+    Set<Category>? scopes,
+    int? expectedGeneration,
+    bool requireTrustedManifest = false,
   }) async {
     final id = newId();
     try {
       final snapshot = await source.manifest();
-      String? cursor;
+      snapshot.validate(category);
+      if (requireTrustedManifest && snapshot.publisherVersion != 1) {
+        throw const ContentFailure('content-manifest-unsupported');
+      }
       var count = 0;
-      while (true) {
-        if (cancelled()) {
-          throw StateError(
-            'Download cancelled. Retry to restart; existing content is preserved.',
-          );
+      final queries = scopes == null
+          ? <Category?>[category]
+          : scopes.length == 3
+          ? <Category?>[null]
+          : <Category?>[...Category.values.where(scopes.contains)];
+      if (queries.isEmpty) throw StateError('No download scope');
+      for (final selected in queries) {
+        String? cursor;
+        while (true) {
+          if (cancelled()) {
+            throw StateError(
+              'Download cancelled. Retry to restart; existing content is preserved.',
+            );
+          }
+          final words = await source.page(selected, cursor);
+          if (cancelled()) throw StateError('Download cancelled.');
+          if (words.isEmpty) break;
+          if (selected != null && words.any((w) => w.category != selected)) {
+            throw StateError('Wrong download category');
+          }
+          var previous = cursor;
+          for (final word in words) {
+            if (previous != null && word.id.compareTo(previous) <= 0) {
+              throw StateError('Invalid download cursor');
+            }
+            previous = word.id;
+          }
+          if (words.any((word) => word.revision > snapshot.revision)) {
+            throw StateError('Word revision exceeds the manifest');
+          }
+          await store.stage(id, words);
+          count += words.length;
+          if (count > 10000) {
+            throw StateError('Download exceeds safe snapshot limit.');
+          }
+          onProgress?.call(count);
+          cursor = words.last.id;
         }
-        final words = await source.page(category, cursor);
-        if (cancelled()) throw StateError('Download cancelled.');
-        if (words.isEmpty) break;
-        if (words.any(
-          (word) => cursor != null && word.id.compareTo(cursor) <= 0,
-        )) {
-          throw StateError('Invalid download cursor');
-        }
-        if (words.any((word) => word.revision > snapshot.revision)) {
-          throw StateError('Word revision exceeds the manifest');
-        }
-        await store.stage(id, words);
-        count += words.length;
-        if (count > 10000) {
-          throw StateError('Download exceeds safe snapshot limit.');
-        }
-        onProgress?.call(count);
-        cursor = words.last.id;
       }
       final closing = await source.manifest();
+      closing.validate(category);
       if (cancelled()) throw StateError('Download cancelled.');
-      if (closing.revision != snapshot.revision) {
+      if (!closing.sameVersion(snapshot)) {
         throw StateError('Content changed during download. Retry.');
       }
       await store.commitDownload(
@@ -455,6 +615,10 @@ class ContentDownloader {
         category,
         snapshot.revision,
         snapshot.groupCounts,
+        stillWanted: () => !cancelled(),
+        scopes: scopes,
+        trustedManifest: snapshot.publisherVersion == 1,
+        expectedGeneration: expectedGeneration,
       );
       return count;
     } catch (_) {

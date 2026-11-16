@@ -3,9 +3,9 @@ import { getAppCheck } from 'firebase-admin/app-check';
 import { getFirestore, FieldValue } from 'firebase-admin/firestore';
 import { onRequest } from 'firebase-functions/v2/https';
 
-export class AccountError extends Error {
-  constructor(readonly status: number, readonly code: string) { super(code); }
-}
+import { AccountError } from './errors';
+import { assertManagedAccess } from './managed_access';
+export { AccountError } from './errors';
 export function validateBody(body: unknown): { action: string; name?: string } {
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw new AccountError(400, 'invalid-input');
   const input = body as Record<string, unknown>;
@@ -28,6 +28,7 @@ export async function accountAction(uid:string, token:DecodedIdToken, body:unkno
   const input=validateBody(body);
   const auth=getAuth();
   let user=await auth.getUser(uid);
+  await assertManagedAccess(token);
   if(user.disabled) throw new AccountError(401,'user-disabled');
   const db=getFirestore();
   // Per-UID bounded request rate; retry does not bypass the limit.

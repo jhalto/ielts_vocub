@@ -35,11 +35,7 @@ Future<void> main(List<String> arguments) async {
     await File(arguments.single).readAsString(),
   ) as Map<String, dynamic>;
   final manifest = json['manifest'] as Map<String, dynamic>;
-  if (manifest['schemaVersion'] != 1) throw StateError('Unsupported manifest');
-  final snapshot = ContentSnapshot(
-    manifest['currentRevision'] as int,
-    Map<String, int>.from(manifest['groupCounts'] as Map),
-  );
+  final snapshot = ContentSnapshot.fromJson(manifest);
   final words =
       (json['words'] as List)
           .map(

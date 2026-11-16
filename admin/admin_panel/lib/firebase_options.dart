@@ -71,5 +71,4 @@ class DefaultFirebaseOptions {
     authDomain: 'ielts-vocubs.firebaseapp.com',
     storageBucket: 'ielts-vocubs.firebasestorage.app',
   );
-
 }
